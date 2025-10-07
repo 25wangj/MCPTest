@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QImage, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
@@ -25,9 +25,11 @@ from PyQt5.QtWidgets import (
 try:
     from .mcp_bridge import MCPBridge, MCPBridgeError
     from .spectrogram import SpectrogramError, generate_spectrogram, resolve_audio_path
+    from .audio_analysis import AudioAnalysisError, analyze_audio
 except ImportError:
     from mcp_bridge import MCPBridge, MCPBridgeError  # type: ignore
     from spectrogram import SpectrogramError, generate_spectrogram, resolve_audio_path  # type: ignore
+    from audio_analysis import AudioAnalysisError, analyze_audio  # type: ignore
 
 
 @dataclass
@@ -47,6 +49,25 @@ class RecordingMetadata:
         return f"{self.duration_seconds:.2f} s"
 
 
+class AudioAnalysisThread(QThread):
+    completed = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, audio_path: Path, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._audio_path = audio_path
+
+    def run(self) -> None:  # pragma: no cover - thread execution
+        try:
+            result = analyze_audio(self._audio_path)
+        except AudioAnalysisError as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:  # pylint: disable=broad-except
+            self.failed.emit(f"Unexpected error during analysis: {exc}")
+        else:
+            self.completed.emit(result.text)
+
+
 class MusicApp(QWidget):
     def __init__(self, bridge: Optional[MCPBridge] = None) -> None:
         super().__init__()
@@ -59,6 +80,7 @@ class MusicApp(QWidget):
         self._last_spectrogram_image: Optional[QImage] = None
         self._last_spectrogram_source: Optional[Path] = None
         self._last_spectrogram_title: Optional[str] = None
+        self._analysis_thread: Optional[AudioAnalysisThread] = None
 
         self.setWindowTitle("Music MCP Controller")
         self._build_ui()
@@ -71,9 +93,18 @@ class MusicApp(QWidget):
         # Current take summary
         curr_layout = QVBoxLayout()
         self.curr_path_label = QLabel("Current take: Unavailable")
+        curr_row = QHBoxLayout()
         self.curr_info_label = QLabel("Size: N/A    Duration: N/A")
+        self.refresh_button = QPushButton("Refresh Metadata")
+        self.refresh_button.setFlat(True)
+        self.refresh_button.setStyleSheet(
+            "padding: 4px; color: #58a6ff; background-color: transparent; border: none;"
+        )
         curr_layout.addWidget(self.curr_path_label)
-        curr_layout.addWidget(self.curr_info_label)
+        curr_row.addWidget(self.curr_info_label)
+        curr_row.addStretch(1)
+        curr_row.addWidget(self.refresh_button)
+        curr_layout.addLayout(curr_row)
         layout.addLayout(curr_layout)
 
         # Recording controls
@@ -92,11 +123,11 @@ class MusicApp(QWidget):
         control_layout.addWidget(self.stop_play_button, 1, 1)
         layout.addLayout(control_layout)
 
-        # Refresh (secondary)
-        refresh_layout = QHBoxLayout()
-        self.refresh_button = QPushButton("Refresh Metadata")
-        self.refresh_button.setFlat(True)
-        self.refresh_button.setStyleSheet(
+        # Analysis controls
+        analysis_layout = QHBoxLayout()
+        self.analyze_button = QPushButton("Analyze Audio")
+        self.analyze_button.setFlat(True)
+        self.analyze_button.setStyleSheet(
             "padding: 4px; color: #58a6ff; background-color: transparent; border: none;"
         )
         self.spectrogram_button = QPushButton("Show Spectrogram")
@@ -109,11 +140,11 @@ class MusicApp(QWidget):
         self.export_spectrogram_button.setStyleSheet(
             "padding: 4px; color: #58a6ff; background-color: transparent; border: none;"
         )
-        refresh_layout.addStretch(1)
-        refresh_layout.addWidget(self.refresh_button)
-        refresh_layout.addWidget(self.spectrogram_button)
-        refresh_layout.addWidget(self.export_spectrogram_button)
-        layout.addLayout(refresh_layout)
+        analysis_layout.addWidget(self.analyze_button)
+        analysis_layout.addWidget(self.spectrogram_button)
+        analysis_layout.addStretch(1)
+        analysis_layout.addWidget(self.export_spectrogram_button)
+        layout.addLayout(analysis_layout)
 
         # Save controls
         save_layout = QHBoxLayout()
@@ -216,6 +247,7 @@ class MusicApp(QWidget):
         link_style = f"padding: 4px; color: {accent}; background-color: transparent; border: none;"
         self.refresh_button.setStyleSheet(link_style)
         self.spectrogram_button.setStyleSheet(link_style)
+        self.analyze_button.setStyleSheet(link_style)
         self.export_spectrogram_button.setStyleSheet(link_style)
 
     def _wire_events(self) -> None:
@@ -228,6 +260,7 @@ class MusicApp(QWidget):
         self.delete_button.clicked.connect(self._handle_delete_take)
         self.refresh_button.clicked.connect(self._refresh_metadata)
         self.spectrogram_button.clicked.connect(self._handle_show_spectrogram)
+        self.analyze_button.clicked.connect(self._handle_analyze_audio)
         self.export_spectrogram_button.clicked.connect(self._handle_export_spectrogram)
         self.table.selectionModel().selectionChanged.connect(self._update_selection_state)
 
@@ -356,6 +389,24 @@ class MusicApp(QWidget):
             return
         self._set_status(f"Spectrogram exported to {target}.")
 
+    def _handle_analyze_audio(self) -> None:
+        fallback = self._fallback_audio_path()
+        try:
+            audio_path = resolve_audio_path(self.curr_path, self.bridge, fallback)
+        except SpectrogramError as exc:
+            self._show_error(str(exc))
+            return
+
+        audio_path = audio_path.resolve()
+        self._set_status("Analyzing audio...")
+        self.analyze_button.setEnabled(False)
+
+        self._analysis_thread = AudioAnalysisThread(audio_path)
+        self._analysis_thread.completed.connect(self._on_analysis_complete)
+        self._analysis_thread.failed.connect(self._on_analysis_failed)
+        self._analysis_thread.finished.connect(self._on_analysis_finished)
+        self._analysis_thread.start()
+
     def _fallback_audio_path(self) -> Path:
         return Path(__file__).resolve().parent.parent / "musicmcp" / "curr.wav"
 
@@ -363,6 +414,17 @@ class MusicApp(QWidget):
         self._last_spectrogram_image = image.copy()
         self._last_spectrogram_source = source.resolve()
         self._last_spectrogram_title = title
+
+    def _on_analysis_complete(self, text: str) -> None:
+        QMessageBox.information(self, "Audio Analysis", text)
+        self._set_status("Audio analysis complete.")
+
+    def _on_analysis_failed(self, message: str) -> None:
+        self._show_error(message)
+
+    def _on_analysis_finished(self) -> None:
+        self.analyze_button.setEnabled(True)
+        self._analysis_thread = None
 
     def _handle_save_take(self) -> None:
         name = self.name_input.text().strip()
