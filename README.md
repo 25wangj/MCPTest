@@ -1,0 +1,1 @@
+An MCP server which records, plays back, and saves audio files, along with a simple app which interfaces with the server and has a few additional features like generating a spectrogram.

@@ -17,6 +17,19 @@ class SpectrogramError(RuntimeError):
     """Raised when generating or exporting a spectrogram fails."""
 
 
+NOTE_FREQUENCIES = [
+    ("C0", 16.35),
+    ("C1", 32.70),
+    ("C2", 65.41),
+    ("C3", 130.81),
+    ("C4", 261.63),
+    ("C5", 523.25),
+    ("C6", 1046.50),
+    ("C7", 2093.00),
+    ("C8", 4186.01),
+]
+
+
 @dataclass
 class SpectrogramAssets:
     pixmap: QPixmap
@@ -60,12 +73,13 @@ def generate_spectrogram(audio_path: Path) -> SpectrogramAssets:
     data = data.astype(np.float32, copy=False)
     if len(data) < 32:
         raise SpectrogramError("Recording too short for spectrogram.")
-    nperseg = int(min(1024, len(data)))
-    noverlap = int(min(nperseg - 1, max(0, int(nperseg * 0.75))))
+    nperseg = int(min(4096, len(data)))
+    noverlap = int(min(nperseg - 1, max(0, int(nperseg * 0.9))))
     try:
         freqs, times, power = scipy_spectrogram(
             data,
             fs=sample_rate,
+            window="hann",
             nperseg=nperseg,
             noverlap=noverlap,
             scaling="spectrum",
@@ -75,6 +89,24 @@ def generate_spectrogram(audio_path: Path) -> SpectrogramAssets:
         raise SpectrogramError(f"Could not compute spectrogram: {exc}") from exc
     if power.size == 0 or times.size == 0 or freqs.size == 0:
         raise SpectrogramError("Spectrogram data is empty.")
+
+    # Convert to logarithmic frequency scale (approx. C0 to C8)
+    freqs_linear = freqs
+    power_linear = power
+    if freqs_linear[0] <= 0 and len(freqs_linear) > 1:
+        freqs_linear = freqs_linear[1:]
+        power_linear = power_linear[1:, :]
+    freq_min = max(16.35, freqs_linear[0] + 1e-6)
+    freq_max = min(4186.01, freqs_linear[-1])
+    if freq_max <= freq_min:
+        freq_min = freqs_linear[0] + 1e-6
+        freq_max = freqs_linear[-1]
+    log_freqs = np.geomspace(freq_min, freq_max, num=len(freqs_linear))
+    power_log = np.empty((len(log_freqs), power_linear.shape[1]), dtype=power_linear.dtype)
+    for col in range(power_linear.shape[1]):
+        power_log[:, col] = np.interp(log_freqs, freqs_linear, power_linear[:, col])
+    freqs = log_freqs
+    power = power_log
 
     power = np.maximum(power, 1e-12)
     power_db = 10 * np.log10(power)
@@ -108,7 +140,7 @@ def generate_spectrogram(audio_path: Path) -> SpectrogramAssets:
     bytes_per_line = buffer.shape[1] * 3
     base_image = QImage(buffer.tobytes(), width, height, bytes_per_line, QImage.Format_RGB888).copy()
 
-    left_margin, right_margin = 70, 20
+    left_margin, right_margin = 110, 20
     top_margin, bottom_margin = 20, 60
     canvas_width = width + left_margin + right_margin
     canvas_height = height + top_margin + bottom_margin
@@ -148,28 +180,51 @@ def generate_spectrogram(audio_path: Path) -> SpectrogramAssets:
             painter.drawText(x - 25, bottom_y + 24, 50, 16, Qt.AlignHCenter, label)
 
     if freqs.size:
-        max_freq = float(freqs[-1]) if freqs[-1] else 1.0
-        tick_count = min(6, freqs.size)
-        indices = sorted({int(round(idx)) for idx in np.linspace(0, freqs.size - 1, tick_count)})
-        for idx in indices:
-            idx = min(freqs.size - 1, max(0, idx))
-            freq_val = float(freqs[idx])
-            ratio = freq_val / max_freq if max_freq else 0.0
-            y_offset = int(round((1 - ratio) * height)) if height > 1 else 0
-            y = top_margin + min(height, max(0, y_offset))
-            painter.setPen(tick_pen)
-            painter.drawLine(left_margin - 6, y, left_margin, y)
-            label = _format_frequency(freq_val)
-            painter.setPen(text_pen)
-            painter.drawText(
-                5,
-                y - 8,
-                left_margin - 12,
-                16,
-                Qt.AlignRight | Qt.AlignVCenter,
-                label,
-            )
-
+        log_min = np.log(freq_min)
+        log_max = np.log(freq_max)
+        note_ticks = [
+            (label, freq_val)
+            for label, freq_val in NOTE_FREQUENCIES
+            if freq_min <= freq_val <= freq_max
+        ]
+        if note_ticks:
+            for label, freq_val in note_ticks:
+                ratio = (np.log(freq_val) - log_min) / (log_max - log_min) if log_max > log_min else 0.0
+                y_offset = int(round((1 - ratio) * (height - 1))) if height > 1 else 0
+                y = top_margin + min(height, max(0, y_offset))
+                painter.setPen(tick_pen)
+                painter.drawLine(left_margin - 6, y, left_margin, y)
+                painter.setPen(text_pen)
+                painter.drawText(
+                    5,
+                    y - 8,
+                    left_margin - 12,
+                    16,
+                    Qt.AlignRight | Qt.AlignVCenter,
+                    f"{label} ({freq_val:.1f} Hz)",
+                )
+        else:
+            max_freq = float(freqs[-1]) if freqs[-1] else 1.0
+            tick_count = min(6, freqs.size)
+            indices = sorted({int(round(idx)) for idx in np.linspace(0, freqs.size - 1, tick_count)})
+            for idx in indices:
+                idx = min(freqs.size - 1, max(0, idx))
+                freq_val = float(freqs[idx])
+                ratio = (np.log(freq_val) - np.log(freqs[0])) / (np.log(max_freq) - np.log(freqs[0])) if max_freq > freqs[0] else 0.0
+                y_offset = int(round((1 - ratio) * (height - 1))) if height > 1 else 0
+                y = top_margin + min(height, max(0, y_offset))
+                painter.setPen(tick_pen)
+                painter.drawLine(left_margin - 6, y, left_margin, y)
+                label = _format_frequency(freq_val)
+                painter.setPen(text_pen)
+                painter.drawText(
+                    5,
+                    y - 8,
+                    left_margin - 12,
+                    16,
+                    Qt.AlignRight | Qt.AlignVCenter,
+                    label,
+                )
     axis_font = QFont()
     axis_font.setPointSize(10)
     axis_font.setBold(True)
@@ -184,7 +239,7 @@ def generate_spectrogram(audio_path: Path) -> SpectrogramAssets:
         "Time (s)",
     )
     painter.save()
-    painter.translate(left_margin - 50, top_margin + height / 2)
+    painter.translate(left_margin - 80, top_margin + height / 2)
     painter.rotate(-90)
     painter.setPen(QPen(QColor("#58a6ff")))
     painter.drawText(
