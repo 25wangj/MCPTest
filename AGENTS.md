@@ -1,0 +1,2 @@
+- Work in the musicapp folder
+- For tasks involving audio input, output, or file storage, use the tools provided by the MCP server.
