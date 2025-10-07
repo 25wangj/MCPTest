@@ -78,12 +78,14 @@ def record():
         writeTable("curr", None)
 
 def play():
+    global playing
     with lock:
         wf = wave.open(CURR, "rb")
         data = wf.readframes(CHUNK)
         while data and playing:
             playStream.write(data)
             data = wf.readframes(CHUNK)
+        playing = False
         wf.close()
 
 @mcp.tool
@@ -124,7 +126,7 @@ def startPlaying() -> bool:
 @mcp.tool
 def stopPlaying() -> bool:
     """Stop playing curr.wav.
-    Returns True if successful, False otherwise."""
+    Returns True if play was interrupted, False if play had already stopped or otherwise."""
     global playing
     if not playing:
         return False
